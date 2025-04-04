@@ -1,0 +1,201 @@
+#include <iostream>
+#include <cstdint>
+#include <cstring>
+#include <unistd.h>
+#include <fcntl.h>
+#include <termios.h>
+#include <thread>
+#include <chrono>
+#include <cerrno>
+#include <string>
+#include <vector>
+
+#define SERIAL_PORT "/dev/ttyUSB0"
+#define BAUD_RATE B115200  // 보드레이트 115200으로 설정
+
+class RS485Controller {
+private:
+    int uart_fd;
+    bool debug_mode;
+
+    // CRC16_MODBUS 계산 함수: 데이터의 CRC-16 값을 계산하여 Modbus 프로토콜에 사용
+    uint16_t CRC16_MODBUS(const uint8_t *data, uint16_t length) {
+        uint16_t crc = 0xFFFF;
+        for (uint16_t i = 0; i < length; i++) {
+            crc ^= (uint16_t)data[i];
+            for (uint8_t j = 0; j < 8; j++) {
+                if (crc & 0x0001) {
+                    crc = (crc >> 1) ^ 0xA001;
+                } else {
+                    crc >>= 1;
+                }
+            }
+        }
+        return crc;
+    }
+
+public:
+    RS485Controller(bool debug = true) : uart_fd(-1), debug_mode(debug) {}
+
+    ~RS485Controller() {
+        if (uart_fd >= 0) {
+            close(uart_fd); // 시리얼 포트가 열려 있으면 닫음
+        }
+    }
+
+    // UART 초기화 함수: 지정된 포트와 보드레이트로 시리얼 포트를 열고 설정
+    bool initUART(const std::string& port = SERIAL_PORT, speed_t baudrate = BAUD_RATE) {
+        uart_fd = open(port.c_str(), O_RDWR | O_NOCTTY | O_NDELAY);
+        if (uart_fd < 0) {
+            std::cerr << "UART 포트 열기 실패: " << strerror(errno) << std::endl;
+            return false;
+        }
+
+        struct termios options;
+        tcgetattr(uart_fd, &options);
+        
+        cfsetispeed(&options, baudrate); // 입력 보드레이트 설정
+        cfsetospeed(&options, baudrate); // 출력 보드레이트 설정
+        
+        options.c_cflag = (options.c_cflag & ~CSIZE) | CS8;    // 8비트 데이터
+        options.c_cflag &= ~PARENB;                            // 패리티 비트 없음
+        options.c_cflag &= ~CSTOPB;                            // 1 스톱 비트
+        options.c_cflag |= CLOCAL | CREAD;                     // 로컬 모드, 읽기 활성화
+        options.c_iflag = 0;                                   // 입력 플래그 초기화
+        options.c_oflag = 0;                                   // 출력 플래그 초기화
+        options.c_lflag = 0;                                   // 로컬 플래그 초기화
+        
+        tcflush(uart_fd, TCIFLUSH); // 입력 버퍼 플러시
+        if (tcsetattr(uart_fd, TCSANOW, &options) != 0) {
+            std::cerr << "UART 설정 실패" << std::endl;
+            close(uart_fd);
+            uart_fd = -1;
+            return false;
+        }
+        
+        // 현재 설정된 보드레이트 출력
+        tcgetattr(uart_fd, &options);
+        speed_t current_speed = cfgetispeed(&options);
+        std::cout << "현재 설정된 보드레이트: ";
+        switch(current_speed) {
+            case B9600: std::cout << "9600"; break;
+            case B19200: std::cout << "19200"; break;
+            case B38400: std::cout << "38400"; break;
+            case B57600: std::cout << "57600"; break;
+            case B115200: std::cout << "115200"; break;
+            default: std::cout << "알 수 없음 (" << current_speed << ")";
+        }
+        std::cout << std::endl;
+        
+        return true;
+    }
+
+    // LED 제어 함수: 지정된 장치 주소와 LED 인덱스로 LED를 켜거나 끔
+    bool controlRelayLED(uint8_t device_addr, bool state, int ledIndex) {
+        if (uart_fd < 0 || device_addr > 0x7F) {
+            if (debug_mode) std::cerr << "잘못된 매개변수 또는 UART가 초기화되지 않음" << std::endl;
+            return false;
+        }
+
+        // LED 인덱스를 1-based로 확인 (1~8 범위)
+        if (ledIndex < 1 || ledIndex > 8) {
+            if (debug_mode) std::cerr << "잘못된 LED 인덱스: " << ledIndex << std::endl;
+            return false;
+        }
+        int hardwareIndex = ledIndex - 1; // 1-based를 0-based로 변환 (하드웨어 주소 계산용)
+
+        std::vector<uint8_t> cmd(8);
+        cmd[0] = device_addr;      // 장치 주소
+        cmd[1] = 0x05;             // Modbus 기능 코드 05 (Write Single Coil)
+        cmd[2] = 0x09;             // 상위 주소
+        cmd[3] = 0x10 + hardwareIndex;  // 하위 주소: 0x10 ~ 0x17 (1~8번 LED)
+        cmd[4] = state ? 0xFF : 0x00; // ON: 0xFF, OFF: 0x00
+        cmd[5] = 0x00;             // 하위 바이트
+
+        uint16_t crc = CRC16_MODBUS(cmd.data(), 6);
+        cmd[6] = crc & 0xFF;       // CRC 저위 바이트
+        cmd[7] = (crc >> 8) & 0xFF; // CRC 고위 바이트
+
+        if (debug_mode) {
+            std::cout << "전송 중인 릴레이 " << (state ? "ON" : "OFF") 
+                      << " 명령 (LED " << ledIndex << ", 주소 0x" << std::hex << (0x10 + hardwareIndex) << std::dec << "): ";
+            for (int j = 0; j < 8; j++) {
+                std::cout << "0x" << std::hex << static_cast<int>(cmd[j]) << " ";
+            }
+            std::cout << std::dec << std::endl;
+        }
+
+        int result = write(uart_fd, cmd.data(), cmd.size());
+        if (result != static_cast<int>(cmd.size())) {
+            if (debug_mode) std::cerr << "릴레이 명령 전송 실패" << std::endl;
+            return false;
+        }
+
+        // 응답 읽기 (디버그 모드에서만)
+        if (debug_mode) {
+            std::vector<uint8_t> response(256);
+            usleep(100000); // 100ms 대기
+            int response_len = read(uart_fd, response.data(), response.size());
+            
+            if (response_len > 0) {
+                std::cout << "응답 수신 (" << response_len << " 바이트): ";
+                for (int i = 0; i < response_len; i++) {
+                    std::cout << "0x" << std::hex << static_cast<int>(response[i]) << " ";
+                }
+                std::cout << std::dec << std::endl;
+            } else {
+                std::cout << "응답 없음" << std::endl;
+            }
+        }
+
+        usleep(100000); // 명령 실행 후 약간의 대기
+        return true;
+    }
+
+    // LED 깜빡임 함수: 1번부터 8번까지 LED를 순차적으로 한 번씩 켜고 끄는 무한 루프 실행
+    void blinkAllLEDs(uint8_t device_addr) {
+        const int START_LED = 1; // 시작 LED (1번)
+        const int END_LED = 8;   // 끝 LED (8번)
+
+        while (true) {
+            // 1번부터 8번까지 순차적으로 한 번씩 깜빡임
+            for (int led_index = START_LED; led_index <= END_LED; led_index++) {
+                // 해당 LED를 켜기
+                bool result = controlRelayLED(device_addr, true, led_index); // 1-based로 입력
+                if (!result) {
+                    std::cerr << "LED " << led_index << " 제어 실패 (ON)" << std::endl;
+                }
+                sleep(1);  // 1초 동안 켜짐 상태 유지
+
+                // 해당 LED를 끄기
+                result = controlRelayLED(device_addr, false, led_index); // 1-based로 입력
+                if (!result) {
+                    std::cerr << "LED " << led_index << " 제어 실패 (OFF)" << std::endl;
+                }
+                sleep(1);  // 1초 동안 꺼짐 상태 유지
+            }
+
+            // 모든 LED 순환이 완료되었음을 알림 (디버그 모드에서만)
+            if (debug_mode) {
+                std::cout << "모든 LED(1~8) 순환 완료. 다시 1번 LED부터 시작." << std::endl;
+            }
+        }
+    }
+};
+
+int main() {
+    RS485Controller controller(true); // 디버그 모드 활성화
+    
+    if (!controller.initUART()) {
+        return -1;
+    }
+
+    uint8_t device_addr = 0x01; // 장치 주소 설정
+    
+    std::cout << "LED 제어 시작. Ctrl+C로 종료하세요." << std::endl;
+    
+    // LED 깜빡임 실행 (별도 스레드 없이 메인 스레드에서 실행)
+    controller.blinkAllLEDs(device_addr);
+    
+    return 0;
+}
